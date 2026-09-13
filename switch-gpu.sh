@@ -13,22 +13,42 @@ is_plugged() {
     return 1
 }
 
-# Динамический поиск активного пользователя графической сессии (Wayland / X11)
-TARGET_USER=$(loginctl list-sessions 2>/dev/null | awk '{print $3}' | grep -v -E 'root|USER|^$' | head -n 1)
-[ -z "$TARGET_USER" ] && TARGET_USER=$(who | awk '$2 ~ /:[0-9]/ {print $1}' | head -n 1)
+# 1. Поиск активного пользователя графической сессии (без loginctl/systemd)
+get_target_user() {
+    ps aux | grep -E '(Hyprland|sway|Xorg|waybar|i3|xfce4-session|wayland)' | \
+    grep -v -E 'root|grep' | awk '{print $1}' | head -n 1
+}
 
-# Функция отправки уведомления
+# 2. Универсальная отправка уведомлений (работает под SysVinit/OpenRC/systemd)
 send_notification() {
     local icon="$1"
     local title="$2"
     local body="$3"
 
-    if [ -n "$TARGET_USER" ]; then
-        local user_id
-        user_id=$(id -u "$TARGET_USER" 2>/dev/null)
-        if [ -n "$user_id" ]; then
-            su "$TARGET_USER" -c "DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$user_id/bus notify-send -i '$icon' '$title' '$body'" 2>/dev/null
-        fi
+    local user
+    user=$(get_target_user)
+    [ -z "$user" ] && return 0
+
+    # Находим PID любого процесса текущего пользователя в графике
+    local user_pid
+    user_pid=$(pgrep -u "$user" -n "Hyprland|waybar|sway|i3|Xorg|dbus-daemon|bash")
+
+    if [ -n "$user_pid" ] && [ -r "/proc/$user_pid/environ" ]; then
+        # Вытягиваем переменные окружения прямо из /proc процесса пользователя
+        local dbus_addr
+        dbus_addr=$(tr '\0' '\n' < "/proc/$user_pid/environ" | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2-)
+        local display_val
+        display_val=$(tr '\0' '\n' < "/proc/$user_pid/environ" | grep '^DISPLAY=' | cut -d= -f2-)
+        local wayland_val
+        wayland_val=$(tr '\0' '\n' < "/proc/$user_pid/environ" | grep '^WAYLAND_DISPLAY=' | cut -d= -f2-)
+
+        # Запускаем notify-send от имени пользователя с его переменными окружения
+        su "$user" -c "
+            export DBUS_SESSION_BUS_ADDRESS='${dbus_addr:-unix:path=/run/user/$(id -u "$user")/bus}'
+            export DISPLAY='${display_val:-:0}'
+            export WAYLAND_DISPLAY='${wayland_val:-wayland-0}'
+            notify-send -i '$icon' '$title' '$body'
+        " 2>/dev/null
     fi
 }
 
@@ -37,7 +57,7 @@ if is_plugged; then
     [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "ac" ] && exit 0
     echo "ac" > "$STATE_FILE"
 
-    # 1. Задаем переменные для новых сессий
+    # Создаем конфиг переключения на NVIDIA
     cat << 'EOF' > /etc/profile.d/nvidia-offload.sh
 export __NV_PRIME_RENDER_OFFLOAD=1
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
@@ -46,7 +66,6 @@ export DRI_PRIME=1
 EOF
     chmod 644 /etc/profile.d/nvidia-offload.sh
 
-    # 2. Отправляем уведомление
     send_notification "nvidia" "Режим питания: Сеть" "NVIDIA активирована для новых процессов"
 
 else
@@ -54,9 +73,8 @@ else
     [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "battery" ] && exit 0
     echo "battery" > "$STATE_FILE"
 
-    # 1. Удаляем конфиг при работе от батареи
+    # Удаляем конфиг при работе от батареи
     rm -f /etc/profile.d/nvidia-offload.sh
 
-    # 2. Отправляем уведомление
     send_notification "battery" "Режим питания: Батарея" "Переход на встройку. Экономия энергии"
 fi
